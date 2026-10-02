@@ -1,0 +1,99 @@
+const express = require('express');
+const cors = require('cors');
+const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
+const db = require('./db');
+
+const PROD = process.env.NODE_ENV === 'production';
+const SECRET = process.env.JWT_SECRET || (PROD ? null : 'dev-secret');
+if (!SECRET) throw new Error('JWT_SECRET is required in production');
+const TYPES = ['ask', 'offer', 'event', 'going', 'other'];
+const app = express();
+app.use(cors());
+app.use(express.json({ limit: '50kb' }));
+
+const wrap = (fn) => (req, res) => { try { fn(req, res); } catch (e) { console.error(e); res.status(500).json({ error: 'Something went wrong.' }); } };
+const auth = (req, res, next) => {
+  const h = req.headers.authorization || '';
+  try { req.uid = jwt.verify(h.replace('Bearer ', ''), SECRET).uid; next(); }
+  catch { res.status(401).json({ error: 'Please sign in again.' }); }
+};
+const normPhone = (p) => { const d = String(p || '').replace(/\D/g, ''); return d.length >= 9 && d.length <= 15 ? d : null; };
+const userJson = (u) => ({ id: u.id, name: u.name, username: u.username, campus: u.campus, profile_complete: !!(u.name && u.username) });
+
+app.post('/v1/auth/request-otp', wrap((req, res) => {
+  const phone = normPhone(req.body.phone);
+  if (!phone) return res.status(400).json({ error: 'Enter a valid phone number.' });
+  const code = String(crypto.randomInt(100000, 1000000));
+  db.prepare('INSERT OR REPLACE INTO otps(phone,code,expires_at,attempts) VALUES(?,?,?,0)').run(phone, code, Date.now() + 5 * 60000);
+  // TODO: send via an SMS provider. Code is never returned in production.
+  if (!PROD) console.log(`[dev] OTP for ${phone}: ${code}`);
+  res.json({ ok: true });
+}));
+
+app.post('/v1/auth/verify-otp', wrap((req, res) => {
+  const phone = normPhone(req.body.phone);
+  const o = phone && db.prepare('SELECT * FROM otps WHERE phone=?').get(phone);
+  if (!o || o.expires_at < Date.now() || o.attempts >= 5) return res.status(400).json({ error: 'That code has expired. Request a new one.' });
+  if (o.code !== String(req.body.code)) {
+    db.prepare('UPDATE otps SET attempts=attempts+1 WHERE phone=?').run(phone);
+    return res.status(400).json({ error: "That code isn't right." });
+  }
+  db.prepare('DELETE FROM otps WHERE phone=?').run(phone);
+  db.prepare('INSERT OR IGNORE INTO users(phone) VALUES(?)').run(phone);
+  const u = db.prepare('SELECT * FROM users WHERE phone=?').get(phone);
+  res.json({ token: jwt.sign({ uid: u.id }, SECRET, { expiresIn: '30d' }), user: userJson(u) });
+}));
+
+app.get('/v1/me', auth, wrap((req, res) => res.json(userJson(db.prepare('SELECT * FROM users WHERE id=?').get(req.uid)))));
+
+app.patch('/v1/me', auth, wrap((req, res) => {
+  const name = String(req.body.name || '').trim().slice(0, 50);
+  const username = String(req.body.username || '').trim().toLowerCase();
+  const campus = String(req.body.campus || '').trim().slice(0, 60);
+  if (!name) return res.status(400).json({ error: 'Add your name.' });
+  if (!/^[a-z0-9_]{3,20}$/.test(username)) return res.status(400).json({ error: 'Usernames are 3–20 letters, numbers or _.' });
+  const taken = db.prepare('SELECT id FROM users WHERE username=? AND id<>?').get(username, req.uid);
+  if (taken) return res.status(409).json({ error: 'That username is taken.' });
+  db.prepare('UPDATE users SET name=?, username=?, campus=? WHERE id=?').run(name, username, campus, req.uid);
+  res.json(userJson(db.prepare('SELECT * FROM users WHERE id=?').get(req.uid)));
+}));
+
+const postSelect = `SELECT p.id,p.type,p.body,p.location,p.created_at,u.name AS author_name,
+  (SELECT COUNT(*) FROM replies r WHERE r.post_id=p.id) AS replies FROM posts p JOIN users u ON u.id=p.user_id`;
+const postJson = (p) => ({ ...p, id: String(p.id), created_at: new Date(p.created_at.replace(' ', 'T') + 'Z').toISOString(), nearby: 0 });
+
+app.get('/v1/posts', auth, wrap((req, res) =>
+  res.json({ data: db.prepare(`${postSelect} ORDER BY p.id DESC LIMIT 50`).all().map(postJson) })));
+
+app.post('/v1/posts', auth, wrap((req, res) => {
+  const body = String(req.body.body || '').trim();
+  const type = req.body.type;
+  if (!TYPES.includes(type)) return res.status(400).json({ error: 'Pick what kind of post this is.' });
+  if (!body || body.length > 280) return res.status(400).json({ error: 'Posts are 1–280 characters.' });
+  const location = req.body.location ? String(req.body.location).slice(0, 80) : null;
+  const id = db.prepare('INSERT INTO posts(user_id,type,body,location) VALUES(?,?,?,?)').run(req.uid, type, body, location).lastInsertRowid;
+  res.status(201).json(postJson(db.prepare(`${postSelect} WHERE p.id=?`).get(id)));
+}));
+
+app.get('/v1/posts/:id/replies', auth, wrap((req, res) =>
+  res.json({ data: db.prepare(`SELECT r.id,r.body,r.created_at,u.name AS author_name FROM replies r JOIN users u ON u.id=r.user_id WHERE r.post_id=? ORDER BY r.id`).all(req.params.id) })));
+
+app.post('/v1/posts/:id/replies', auth, wrap((req, res) => {
+  const body = String(req.body.body || '').trim();
+  if (!body || body.length > 280) return res.status(400).json({ error: 'Replies are 1–280 characters.' });
+  if (!db.prepare('SELECT 1 FROM posts WHERE id=?').get(req.params.id)) return res.status(404).json({ error: 'That post is gone.' });
+  db.prepare('INSERT INTO replies(post_id,user_id,body) VALUES(?,?,?)').run(req.params.id, req.uid, body);
+  res.status(201).json({ ok: true });
+}));
+
+// Balance = sum of COMPLETED rows only. Nothing here can complete a transaction.
+app.get('/v1/wallet', auth, wrap((req, res) => {
+  const bal = db.prepare("SELECT COALESCE(SUM(amount),0) AS b FROM transactions WHERE user_id=? AND status='completed'").get(req.uid).b;
+  const tx = db.prepare('SELECT id,amount,kind,counterparty,status,created_at FROM transactions WHERE user_id=? ORDER BY id DESC LIMIT 50').all(req.uid);
+  res.json({ balance: bal, currency: 'KES', transactions: tx });
+}));
+
+app.use((req, res) => res.status(404).json({ error: 'Not found.' }));
+if (require.main === module) app.listen(process.env.PORT || 3000, () => console.log('PAL API up'));
+module.exports = app;

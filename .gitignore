@@ -1,0 +1,6 @@
+node_modules/
+.env
+pal.db
+pal.db-shm
+pal.db-wal
+uploads/
