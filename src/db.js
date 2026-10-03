@@ -121,6 +121,20 @@ INSERT OR IGNORE INTO pal_achievements(id,name,description) VALUES
 	('five_verified','Campus Regular','Complete five activities with valid PAL QR scans.');
 `);
 
+const verificationColumns = new Set(
+	db.pragma('table_info(activity_verifications)').map((column) => column.name)
+);
+if (!verificationColumns.has('created_at')) {
+	db.exec('ALTER TABLE activity_verifications ADD COLUMN created_at TEXT');
+	if (verificationColumns.has('verified_at')) {
+		db.exec(`
+			UPDATE activity_verifications
+			SET created_at = COALESCE(verified_at, CURRENT_TIMESTAMP)
+			WHERE created_at IS NULL
+		`);
+	}
+}
+
 const postColumns = new Set(db.pragma('table_info(posts)').map((column) => column.name));
 for (const [name, definition] of [
 	['campus', 'TEXT'],

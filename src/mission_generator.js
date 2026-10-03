@@ -2,24 +2,54 @@ const crypto = require('crypto');
 
 const templates = [
   {
-    key: 'visit-challenge',
-    title: 'Campus location challenge',
-    description: 'Visit {location} and complete the PAL challenge.',
+    key: 'quick-walk',
+    title: 'Quick campus walk',
+    description: 'Walk to {location} and scan its PAL code to check in.',
     xp: 150,
   },
   {
-    key: 'discover-place',
-    title: 'Discover a campus spot',
-    description: 'Explore {location} and share what makes it worth finding.',
+    key: 'new-detail',
+    title: 'Find one new detail',
+    description: 'Visit {location}, notice one thing you had not seen before, and scan its PAL code.',
     xp: 200,
   },
   {
-    key: 'pal-check-in',
-    title: 'PAL campus check-in',
-    description: 'Bring a PAL to {location} and take on the campus challenge together.',
+    key: 'study-break',
+    title: 'Take a five-minute break',
+    description: 'Take a short break at {location} and scan its PAL code.',
     xp: 250,
   },
+  {
+    key: 'new-route',
+    title: 'Try a different route',
+    description: 'Take a different campus route to {location} and scan its PAL code.',
+    xp: 150,
+  },
+  {
+    key: 'photo-stop',
+    title: 'Campus photo stop',
+    description: 'Find a detail worth photographing at {location}, then scan its PAL code.',
+    xp: 200,
+  },
+  {
+    key: 'pal-meetup',
+    title: 'Meet a PAL on campus',
+    description: 'Meet a PAL at {location} and scan its PAL code together.',
+    xp: 250,
+  },
+  {
+    key: 'quiet-corner',
+    title: 'Find a quiet corner',
+    description: 'Spend a few minutes at {location} and scan its PAL code.',
+    xp: 150,
+  },
 ];
+
+function dailyTemplates(cycle) {
+  const day = Math.floor(Date.parse(`${cycle}T00:00:00Z`) / 86400000);
+  const start = ((day % templates.length) + templates.length) % templates.length;
+  return Array.from({ length: 3 }, (_, offset) => templates[(start + offset) % templates.length]);
+}
 
 function generateMissions(db, userId) {
   const user = db.prepare('SELECT campus FROM users WHERE id=?').get(userId);
@@ -44,17 +74,12 @@ function generateMissions(db, userId) {
     ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
   `);
   const now = Date.now();
-  const lastGeneration = db.prepare(
-    'SELECT generated_at FROM mission_generation WHERE campus_key=?'
-  ).get(campusKey);
-  const refreshDue = !lastGeneration || now - lastGeneration.generated_at >= 24 * 60 * 60 * 1000;
   const start = new Date(now);
   const end = new Date(now + 7 * 24 * 60 * 60 * 1000);
 
   const create = db.transaction(() => {
-    if (!refreshDue) return;
     for (const [locationIndex, { location }] of locations.entries()) {
-      for (const template of templates) {
+      for (const template of dailyTemplates(cycle)) {
         const generatedKey = `${template.key}:${campusKey}:${location.trim().toLowerCase()}:${cycle}`;
         insert.run(
           template.title,
@@ -90,4 +115,4 @@ function generateMissions(db, userId) {
   `).all(campus, start.toISOString());
 }
 
-module.exports = { generateMissions, templates };
+module.exports = { generateMissions, dailyTemplates, templates };

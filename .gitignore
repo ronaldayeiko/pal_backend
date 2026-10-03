@@ -4,3 +4,7 @@ pal.db
 pal.db-shm
 pal.db-wal
 uploads/
+
+pal.db
+pal.db-*
+pal.db.backup

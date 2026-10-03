@@ -12,6 +12,7 @@ const PROD = process.env.NODE_ENV === 'production';
 const SECRET = process.env.JWT_SECRET || (PROD ? null : 'dev-secret');
 if (!SECRET) throw new Error('JWT_SECRET is required in production');
 const TYPES = ['ask', 'offer', 'event', 'going', 'other'];
+const XP_PER_LEVEL = 1000;
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '50kb' }));
@@ -24,18 +25,31 @@ const auth = (req, res, next) => {
   catch { res.status(401).json({ error: 'Please sign in again.' }); }
 };
 const normPhone = (p) => { const d = String(p || '').replace(/\D/g, ''); return d.length >= 9 && d.length <= 15 ? d : null; };
-const userJson = (u) => ({
-  id: u.id,
-  name: u.name,
-  username: u.username,
-  email: u.email,
-  campus: u.campus,
-  country: u.country || null,
-  city: u.city || null,
-  profile_photo_url: u.profile_photo_url,
-  profile_complete: !!(u.name && u.username),
-  is_admin: String(process.env.PAL_ADMIN_IDS || '').split(',').map((id) => id.trim()).includes(String(u.id)),
-});
+const userJson = (u) => {
+  const xp = Number(db.prepare(
+    'SELECT COALESCE(SUM(xp_awarded),0) AS total FROM activity_verifications WHERE user_id=?'
+  ).get(u.id).total);
+  return {
+    id: u.id,
+    name: u.name,
+    username: u.username,
+    email: u.email,
+    campus: u.campus,
+    country: u.country || null,
+    city: u.city || null,
+    profile_photo_url: u.profile_photo_url,
+    xp,
+    level: Math.floor(xp / XP_PER_LEVEL) + 1,
+    missions_completed: Number(db.prepare(`
+      SELECT COUNT(*) AS total
+      FROM activity_verifications v
+      JOIN activities a ON a.id=v.activity_id
+      WHERE v.user_id=? AND a.generated_key IS NOT NULL
+    `).get(u.id).total),
+    profile_complete: !!(u.name && u.username),
+    is_admin: String(process.env.PAL_ADMIN_IDS || '').split(',').map((id) => id.trim()).includes(String(u.id)),
+  };
+};
 const userCampus = (userId) => db.prepare('SELECT campus FROM users WHERE id=?').get(userId)?.campus || '';
 const canManageActivity = (activity, userId) =>
   activity.created_by === userId ||
@@ -48,7 +62,7 @@ function awardActivity(activity, userId) {
     return {
       already_verified: true,
       xp_awarded: existing.xp_awarded,
-      cash_awarded: existing.cash_awarded,
+      cash_awarded: 0,
       creature: null,
     };
   }
@@ -63,9 +77,9 @@ function awardActivity(activity, userId) {
   `).get(userId);
   db.transaction(() => {
     db.prepare(`
-      INSERT INTO activity_verifications(activity_id,user_id,xp_awarded,cash_awarded)
-      VALUES(?,?,?,?)
-    `).run(activity.id, userId, activity.xp_reward, activity.cash_reward);
+      INSERT INTO activity_verifications(activity_id,user_id,xp_awarded,cash_awarded,created_at)
+      VALUES(?,?,?,?,CURRENT_TIMESTAMP)
+    `).run(activity.id, userId, activity.xp_reward, 0);
     if (creature) {
       db.prepare(`
         INSERT OR IGNORE INTO user_creatures(user_id,creature_id,activity_id)
@@ -89,7 +103,7 @@ function awardActivity(activity, userId) {
   return {
     already_verified: false,
     xp_awarded: activity.xp_reward,
-    cash_awarded: activity.cash_reward,
+    cash_awarded: 0,
     creature: creature ? { id: creature.id, name: creature.name, rarity: creature.rarity } : null,
   };
 }
@@ -321,7 +335,7 @@ app.get('/v1/activities', auth, wrap((req, res) => {
       is_mission: !!a.generated_key,
       participants: Number(a.participants || 0),
       xp_reward: Number(a.xp_reward || 0),
-      cash_reward: Number(a.cash_reward || 0),
+      cash_reward: 0,
       joined,
       verified: !!db.prepare('SELECT 1 FROM activity_verifications WHERE activity_id=? AND user_id=?').get(a.id, req.uid),
     };
@@ -341,7 +355,7 @@ app.get('/v1/missions', auth, wrap((req, res) => {
       'SELECT COUNT(*) AS count FROM activity_members WHERE activity_id=?'
     ).get(mission.id).count || 0),
     xp_reward: Number(mission.xp_reward || 0),
-    cash_reward: Number(mission.cash_reward || 0),
+    cash_reward: 0,
     joined: !!db.prepare(
       'SELECT 1 FROM activity_members WHERE activity_id=? AND user_id=?'
     ).get(mission.id, req.uid),
@@ -416,9 +430,9 @@ app.get('/v1/leaderboard', auth, wrap((req, res) => {
         u.id,u.name,u.username,u.profile_photo_url,u.country,u.city,
         COALESCE(v.activity_count,0) AS verified_activities,
         COALESCE(a.achievement_count,0) AS verified_achievements,
-        COALESCE(v.xp,0) + COALESCE(a.achievement_count,0) * 100 AS score,
+        COALESCE(v.xp,0) AS score,
         ROW_NUMBER() OVER (
-          ORDER BY COALESCE(v.xp,0) + COALESCE(a.achievement_count,0) * 100 DESC,
+          ORDER BY COALESCE(v.xp,0) DESC,
             COALESCE(v.activity_count,0) DESC, u.name COLLATE NOCASE, u.id
         ) AS rank
       FROM users u
@@ -458,7 +472,39 @@ app.post('/v1/activities', auth, wrap((req, res) => {
     INSERT INTO activities(title,description,location,starts_at,ends_at,xp_reward,cash_reward,qr_code,qr_expires_at,status,created_by,campus,visibility)
     VALUES(?,?,?,?,?,?,0,?,?, 'active',?,?,?)
   `).run(title, description, location, new Date(startsAt).toISOString(), new Date(endsAt).toISOString(), 100, qrCode, endsAt, req.uid, campus, visibility);
-  res.status(201).json({ id: String(result.lastInsertRowid), qr_code: qrCode, expires_at: endsAt, visibility });
+  res.status(201).json({
+    id: String(result.lastInsertRowid),
+    qr_code: qrCode,
+    created_by: req.uid,
+    starts_at: new Date(startsAt).toISOString(),
+    ends_at: new Date(endsAt).toISOString(),
+    expires_at: endsAt,
+    duration_days: Math.ceil((endsAt - startsAt) / 86400000),
+    visibility,
+  });
+}));
+
+app.get('/v1/activities/:id/qr', auth, wrap((req, res) => {
+  const activity = db.prepare(`
+    SELECT id,qr_code,qr_expires_at,starts_at,ends_at,created_by,generated_key
+    FROM activities WHERE id=?
+  `).get(req.params.id);
+  if (!activity) return res.status(404).json({ error: 'Activity not found.' });
+  if (activity.generated_key || !canManageActivity(activity, req.uid)) {
+    return res.status(403).json({ error: 'Only the activity poster can view its QR code.' });
+  }
+  const duration = Date.parse(activity.ends_at) - Date.parse(activity.starts_at);
+  res.json({
+    id: String(activity.id),
+    qr_code: activity.qr_code,
+    starts_at: activity.starts_at,
+    ends_at: activity.ends_at,
+    expires_at: activity.qr_expires_at,
+    duration_days: Number.isFinite(duration) ? Math.ceil(duration / 86400000) : null,
+    days_remaining: Number.isFinite(Date.parse(activity.ends_at))
+      ? Math.max(0, Math.ceil((Date.parse(activity.ends_at) - Date.now()) / 86400000))
+      : 0,
+  });
 }));
 
 app.post('/v1/activities/:id/qr', auth, wrap((req, res) => {
@@ -500,7 +546,7 @@ app.get('/v1/activities/:id', auth, wrap((req, res) => {
     is_mission: !!activity.generated_key,
     participants: Number(activity.participants || 0),
     xp_reward: Number(activity.xp_reward || 0),
-    cash_reward: Number(activity.cash_reward || 0),
+    cash_reward: 0,
     joined,
     verified: !!db.prepare('SELECT 1 FROM activity_verifications WHERE activity_id=? AND user_id=?').get(activity.id, req.uid),
   });
@@ -547,7 +593,7 @@ app.get('/v1/scan/:code', auth, wrap((req, res) => {
     is_mission: !!activity.generated_key,
     participants: Number(activity.participants || 0),
     xp_reward: Number(activity.xp_reward || 0),
-    cash_reward: Number(activity.cash_reward || 0),
+    cash_reward: 0,
     joined,
     verified: !!db.prepare('SELECT 1 FROM activity_verifications WHERE activity_id=? AND user_id=?').get(activity.id, req.uid),
   });
@@ -612,7 +658,7 @@ app.post('/v1/activities/:id/verify', auth, wrap((req, res) => {
       verified: true,
       already_verified: true,
       xp_awarded: existing.xp_awarded,
-      cash_awarded: existing.cash_awarded,
+      cash_awarded: 0,
     });
   }
 
