@@ -120,6 +120,19 @@ SET campus = (
 )
 WHERE campus IS NULL AND created_by IS NOT NULL;
 
+CREATE TABLE IF NOT EXISTS activity_members(
+    id INTEGER PRIMARY KEY,
+    activity_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    joined_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(activity_id, user_id)
+);
+
+CREATE INDEX IF NOT EXISTS activity_members_activity
+ON activity_members(activity_id);
+
+CREATE INDEX IF NOT EXISTS activity_members_user
+ON activity_members(user_id);
 CREATE TABLE IF NOT EXISTS activity_qr_scans(
     id INTEGER PRIMARY KEY,
     activity_id INTEGER NOT NULL,
@@ -245,3 +258,4 @@ WHERE campus IS NULL;
 `);
 
 module.exports = db;
+
